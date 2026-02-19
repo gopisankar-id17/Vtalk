@@ -28,6 +28,14 @@ const ICE_CONFIG = {
   rtcpMuxPolicy: 'require',
 };
 
+console.log('🔧 ICE Config:', JSON.stringify(ICE_CONFIG, null, 2));
+if (!turnUrl) {
+  console.warn('⚠️ TURN server not configured - connections may fail across networks');
+} else {
+  console.log('✅ TURN servers configured:', iceServers.filter(s => s.username));
+}
+
+
 /**
  * Prefer a codec by moving it to the top of the SDP m= line.
  * This nudges the browser to pick lower-latency codecs.
@@ -136,6 +144,7 @@ export function createPeerConnection(peerId, socket, localStream, onRemoteStream
 
   pc.onicecandidate = (event) => {
     if (event.candidate) {
+       console.log('📡 ICE Candidate type:', event.candidate.type);
       candidateBatch.push(event.candidate);
       if (!batchTimer) {
         batchTimer = setTimeout(flushCandidates, 50);
