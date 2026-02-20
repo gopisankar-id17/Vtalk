@@ -4,13 +4,16 @@ import { useState, useEffect, useRef } from 'react';
 import VideoPlayer from '@/components/VideoPlayer';
 import { useWebRTC } from '@/hooks/useWebRTC';
 import { useDevices } from '@/hooks/useDevices';
+import { useRecorder } from '@/hooks/useRecorder';
+import { useTranscript } from '@/hooks/useTranscript';
 import ChatBox from '@/components/ChatBox';
 import EmojiReactions from '@/components/EmojiReactions';
+import TranscriptPanel from '@/components/TranscriptPanel';
 import { useSocket } from '@/hooks/useSocket';
 import {
   Copy, Check, Users, Mic, MicOff, Video, VideoOff, PhoneOff,
   Settings, ChevronDown, X, ChevronUp, Clock, MessageCircle,
-  MonitorUp, MonitorOff,
+  MonitorUp, MonitorOff, Circle, FileText,
 } from 'lucide-react';
 
 // Session timer hook
@@ -58,12 +61,36 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
     setSelectedVideoId,
   } = useDevices();
 
+  // Recording
+  const { isRecording, startRecording, stopRecording, recordingDuration, isSupported: recorderSupported } = useRecorder(localStream, roomId, (blob) => handleTranscription(blob));
+  const [showStopRecordConfirm, setShowStopRecordConfirm] = useState(false);
+
+  // Transcript - continuous background recording
+  const [showTranscript, setShowTranscript] = useState(false);
+  const { segments, interimText, isListening, isSupported: transcriptSupported } = useTranscript(roomId, userName, true);
+
   const [mounted, setMounted] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showDeviceMenu, setShowDeviceMenu] = useState(false);
   const [showParticipants, setShowParticipants] = useState(false);
+  // Chat state lifted for persistence
   const [showChat, setShowChat] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
+  const [isProcessingAI, setIsProcessingAI] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+
+  // ✅ FIX 1: Default to Puter Cloud in production, Local in dev
+  const [useLocalWhisper, setUseLocalWhisper] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    }
+    return false;
+  });
+  const [aiSummary, setAiSummary] = useState('');
+
+  const WHISPER_URL = process.env.NEXT_PUBLIC_WHISPER_URL || 'http://127.0.0.1:5001';
+
   const chatRef = useRef(null);
   const deviceMenuRef = useRef(null);
   const participantsRef = useRef(null);
@@ -82,10 +109,11 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
     return () => document.removeEventListener('mousedown', handleClick);
   }, []);
 
-  // Track unread messages when chat is closed
+  // Listen for socket messages in parent to persist state
   useEffect(() => {
     if (!socket) return;
     const handleChatMsg = (msg) => {
+      setChatMessages((prev) => [...prev, msg]);
       if (!showChat && msg.userId !== socket.id) {
         setUnreadCount((c) => c + 1);
       }
@@ -94,7 +122,16 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
     return () => { socket.off('chat-message', handleChatMsg); };
   }, [socket, showChat]);
 
-  const handleLeave = () => { cleanup(); onLeave(); };
+  const handleLeave = () => {
+    if (isTranscribing) {
+      if (!window.confirm('Transcription is still in progress. If you leave now, the final part of your recording might not be saved. Leave anyway?')) {
+        return;
+      }
+    }
+    socket?.emit('leave-room', { roomId });
+    cleanup();
+    onLeave();
+  };
 
   const handleCopyId = () => {
     navigator.clipboard.writeText(roomId);
@@ -110,6 +147,130 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
   const handleVideoDeviceChange = (deviceId) => {
     setSelectedVideoId(deviceId);
     switchDevice('video', deviceId);
+  };
+
+  const handleRecordToggle = () => {
+    if (isRecording) {
+      setShowStopRecordConfirm(true);
+    } else {
+      startRecording();
+    }
+  };
+
+  const handleConfirmStopRecording = () => {
+    stopRecording();
+    setShowStopRecordConfirm(false);
+  };
+
+  // ✅ Hardened transcription — auto-tries local if dev, otherwise Cloud.
+  const handleTranscription = async (blob) => {
+    setIsTranscribing(true);
+    setShowTranscript(true);
+
+    try {
+      let text = '';
+
+      if (useLocalWhisper) {
+        // --- Local Whisper path ---
+        console.log(`[AI] Dev Mode: Sending to Local Whisper at ${WHISPER_URL}`);
+        const formData = new FormData();
+        formData.append('file', blob, 'video.webm');
+
+        const response = await fetch(`${WHISPER_URL}/transcribe`, {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`Local Whisper error: ${errorText}`);
+        }
+
+        const data = await response.json();
+        if (data.error) throw new Error(data.error);
+        text = data.text;
+
+      } else {
+        // --- Puter cloud path (Production Default) ---
+        console.log('[AI] Prod Mode: Sending to Puter Cloud...');
+
+        // Check if Puter JS is loaded
+        if (typeof window === 'undefined' || !window.puter) {
+          throw new Error('Puter.js script not loaded. Check your ad-blocker or internet connection.');
+        }
+
+        const puterAI = window.puter?.ai;
+        const transcribeFunction = puterAI?.transcribe || puterAI?.speech2txt;
+
+        if (typeof transcribeFunction !== 'function') {
+          throw new Error('Puter AI Transcription service is currently unavailable.');
+        }
+
+        text = await transcribeFunction(blob);
+        console.log('[AI] Puter response received successfully.');
+      }
+
+      if (text && text.trim()) {
+        const finalText = text.toString().trim();
+        console.log(`[AI] Final Transcript: "${finalText.slice(0, 50)}..."`);
+
+        const finalSegment = {
+          speaker: 'Full Recording',
+          timestamp: Date.now(),
+          text: finalText,
+        };
+        socket.emit('transcript-segment', { roomId, segment: finalSegment });
+        handleAISummary(finalText);
+      } else {
+        console.warn('[AI] Transcription returned empty text.');
+      }
+
+    } catch (err) {
+      console.error('[AI] Transcription error:', err.message);
+      if (socket) {
+        socket.emit('transcript-segment', {
+          roomId,
+          segment: {
+            speaker: 'System',
+            timestamp: Date.now(),
+            text: `⚠️ Transcription failed: ${err.message}`,
+          },
+        });
+      }
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
+
+  const handleAISummary = async (overrideText = null) => {
+    const textToProcess = overrideText || segments.map(s => `[${s.speaker}]: ${s.text}`).join('\n');
+    if (!textToProcess) return;
+
+    setIsProcessingAI(true);
+    setAiSummary('Generating AI summary and extracting tasks...');
+
+    try {
+      // We emit the full transcript text to the backend, which will then use its own Gemini instance
+      // to generate the summary and tasks, ensuring higher reliability than client-side Puter.
+      socket?.emit('update-summary', { roomId, summary: textToProcess });
+
+      // Update UI to show we sent it
+      setAiSummary('AI processing started on server...');
+      setShowTranscript(true);
+    } catch (err) {
+      console.error('[AI] Error triggering summary:', err);
+      setAiSummary('⚠️ AI processing failed to start.');
+    } finally {
+      setIsProcessingAI(false);
+    }
+  };
+
+  // Format recording duration
+  const formatRecDuration = (secs) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(m)}:${pad(s)}`;
   };
 
   const participantCount = Object.keys(remoteStreams).length + 1;
@@ -129,64 +290,132 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
   return (
     <div className={`flex flex-col h-screen bg-[#0A0A0A] transition-opacity duration-500 ${mounted ? 'opacity-100' : 'opacity-0'}`}>
 
-      {/* Video Grid */}
-      <div className="flex-1 p-2 sm:p-4 overflow-hidden">
-        <div className={`grid gap-2 sm:gap-3 h-full auto-rows-fr ${
-          tileCount === 1
+      {/* Recording HUD */}
+      {isRecording && (
+        <div className="absolute top-4 right-4 z-50 flex items-center gap-2 px-3 py-1.5 rounded-full frost-glass animate-fade-in">
+          <div className="w-2 h-2 rounded-full bg-red-500 animate-rec-pulse" />
+          <span className="text-red-400 text-xs font-satoshi font-bold uppercase tracking-wider">REC</span>
+          <span className="text-white/50 text-xs font-cabinet tabular-nums">{formatRecDuration(recordingDuration)}</span>
+        </div>
+      )}
+
+      {/* Stop Recording Confirm Dialog */}
+      {showStopRecordConfirm && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm animate-fade-in">
+          <div className="frost-glass-panel rounded-2xl p-6 max-w-xs mx-4 text-center">
+            <div className="w-12 h-12 rounded-full bg-red-500/15 flex items-center justify-center mx-auto mb-3">
+              <Circle size={20} className="text-red-400" fill="currentColor" />
+            </div>
+            <h3 className="text-white/90 text-sm font-satoshi font-bold mb-1">Stop Recording?</h3>
+            <p className="text-white/40 text-xs font-cabinet mb-4">The recording will be downloaded as a .webm file.</p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowStopRecordConfirm(false)}
+                className="flex-1 py-2.5 rounded-xl frost-glass frost-glass-hover text-white/60 text-sm font-cabinet font-medium transition-all"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmStopRecording}
+                className="flex-1 py-2.5 rounded-xl bg-red-500 hover:bg-red-600 text-white text-sm font-satoshi font-bold transition-all"
+              >
+                Stop & Download
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Video Grid + Sidebar Panels */}
+      <div className="flex-1 flex overflow-hidden">
+        <div className="flex-1 p-2 sm:p-4 overflow-hidden relative">
+          <div className={`grid gap-2 sm:gap-3 h-full auto-rows-fr ${tileCount === 1
             ? 'grid-cols-1 max-w-lg sm:max-w-3xl mx-auto'
             : tileCount === 2
-            ? 'grid-cols-1 md:grid-cols-2'
-            : tileCount <= 4
-            ? 'grid-cols-2'
-            : 'grid-cols-2 lg:grid-cols-3'
-        }`}>
-          {/* Local Video (camera) */}
-          <VideoPlayer
-            stream={localStream}
-            muted={true}
-            label={userName || 'You'}
-            isAudioMuted={isAudioMuted}
-            isVideoOff={isVideoOff}
-            isLocal={true}
-            avatarColor="from-[#556B2F] to-[#6B8E3D]"
-          />
-
-          {/* Local Screen Share (separate tile) */}
-          {isScreenSharing && screenStream && (
+              ? 'grid-cols-1 md:grid-cols-2'
+              : tileCount <= 4
+                ? 'grid-cols-2'
+                : 'grid-cols-2 lg:grid-cols-3'
+            }`}>
+            {/* Local Video */}
             <VideoPlayer
-              stream={screenStream}
+              stream={localStream}
               muted={true}
-              label={`${userName || 'You'}'s screen`}
-              isAudioMuted={false}
-              isVideoOff={false}
-              isLocal={false}
-              isScreenSharing={true}
+              label={userName || 'You'}
+              isAudioMuted={isAudioMuted}
+              isVideoOff={isVideoOff}
+              isLocal={true}
               avatarColor="from-[#556B2F] to-[#6B8E3D]"
             />
-          )}
 
-          {/* Remote Videos */}
-          {Object.entries(remoteStreams).map(([peerId, stream], idx) => {
-            const peerMedia = remoteMediaState[peerId];
-            return (
+            {/* Local Screen Share */}
+            {isScreenSharing && screenStream && (
               <VideoPlayer
-                key={peerId}
-                stream={stream}
-                muted={false}
-                label={nameMap[peerId] || `Peer ${peerId.slice(0, 6)}`}
-                isAudioMuted={peerMedia ? !peerMedia.audio : false}
-                isVideoOff={peerMedia ? !peerMedia.video : false}
+                stream={screenStream}
+                muted={true}
+                label={`${userName || 'You'}'s screen`}
+                isAudioMuted={false}
+                isVideoOff={false}
                 isLocal={false}
-                isScreenSharing={!!remoteScreenState[peerId]}
-                avatarColor={avatarColors[idx % avatarColors.length]}
+                isScreenSharing={true}
+                avatarColor="from-[#556B2F] to-[#6B8E3D]"
               />
-            );
-          })}
+            )}
+
+            {/* Remote Videos */}
+            {participants.map((p, idx) => {
+              const stream = remoteStreams[p.id];
+              const mediaState = remoteMediaState[p.id] || { audio: true, video: true };
+              return (
+                <VideoPlayer
+                  key={p.id}
+                  stream={stream}
+                  muted={false}
+                  label={p.name}
+                  isAudioMuted={!mediaState.audio}
+                  isVideoOff={!mediaState.video}
+                  isLocal={false}
+                  isScreenSharing={!!remoteScreenState[p.id]}
+                  avatarColor={avatarColors[(idx + 1) % avatarColors.length]}
+                />
+              );
+            })}
+          </div>
         </div>
+
+        {/* Sidebar panels (Transcript and ChatBox) */}
+        {(showTranscript || showChat) && (
+          <div className="w-80 sm:w-96 shrink-0 p-2 sm:p-4 flex flex-col gap-4 animate-[fade-in-right_0.2s_ease-out]">
+            {showTranscript && (
+              <TranscriptPanel
+                roomId={roomId}
+                segments={segments}
+                interimText={interimText}
+                aiSummary={aiSummary}
+                isProcessingAI={isProcessingAI}
+                isTranscribing={isTranscribing}
+                useLocalWhisper={useLocalWhisper}
+                onToggleLocal={() => setUseLocalWhisper(!useLocalWhisper)}
+                onRunAI={() => handleAISummary()}
+                onClose={() => setShowTranscript(false)}
+              />
+            )}
+
+            {showChat && (
+              <ChatBox
+                socket={socket}
+                roomId={roomId}
+                userName={userName}
+                messages={chatMessages}
+                onClose={() => setShowChat(false)}
+              />
+            )}
+          </div>
+        )}
       </div>
 
       {/* Bottom bar */}
-      <div className="relative px-3 sm:px-5 py-3 sm:py-4">
+      <div className="relative px-3 sm:px-5 py-3 sm:py-4 border-t border-white/[0.05]">
         <div className="flex items-end justify-between gap-3">
 
           {/* Left: Timer + Live + Room code */}
@@ -223,11 +452,10 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
             {/* Mic toggle */}
             <button
               onClick={toggleAudio}
-              className={`w-11 h-11 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-all duration-300 ${
-                isAudioMuted
-                  ? 'bg-red-500/20 hover:bg-red-500/30'
-                  : 'bg-white/[0.08] hover:bg-white/[0.14]'
-              }`}
+              className={`w-11 h-11 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-all duration-300 ${isAudioMuted
+                ? 'bg-red-500/20 hover:bg-red-500/30'
+                : 'bg-white/[0.08] hover:bg-white/[0.14]'
+                }`}
               title={isAudioMuted ? 'Unmute' : 'Mute'}
             >
               {isAudioMuted ? <MicOff size={18} className="text-red-400" /> : <Mic size={18} className="text-white/80" />}
@@ -236,11 +464,10 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
             {/* Video toggle */}
             <button
               onClick={toggleVideo}
-              className={`w-11 h-11 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-all duration-300 ${
-                isVideoOff
-                  ? 'bg-red-500/20 hover:bg-red-500/30'
-                  : 'bg-white/[0.08] hover:bg-white/[0.14]'
-              }`}
+              className={`w-11 h-11 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-all duration-300 ${isVideoOff
+                ? 'bg-red-500/20 hover:bg-red-500/30'
+                : 'bg-white/[0.08] hover:bg-white/[0.14]'
+                }`}
               title={isVideoOff ? 'Turn on camera' : 'Turn off camera'}
             >
               {isVideoOff ? <VideoOff size={18} className="text-red-400" /> : <Video size={18} className="text-white/80" />}
@@ -249,17 +476,33 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
             {/* Screen Share */}
             <button
               onClick={isScreenSharing ? stopScreenShare : startScreenShare}
-              className={`w-11 h-11 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-all duration-300 ${
-                isScreenSharing
-                  ? 'bg-[#556B2F]/30 hover:bg-[#556B2F]/40 ring-1 ring-[#556B2F]/50'
-                  : 'bg-white/[0.08] hover:bg-white/[0.14]'
-              }`}
+              className={`w-11 h-11 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-all duration-300 ${isScreenSharing
+                ? 'bg-[#556B2F]/30 hover:bg-[#556B2F]/40 ring-1 ring-[#556B2F]/50'
+                : 'bg-white/[0.08] hover:bg-white/[0.14]'
+                }`}
               title={isScreenSharing ? 'Stop sharing' : 'Share screen'}
             >
               {isScreenSharing
                 ? <MonitorOff size={18} className="text-[#6B8E3D]" />
                 : <MonitorUp size={18} className="text-white/80" />
               }
+            </button>
+
+            {/* Record button */}
+            <button
+              onClick={handleRecordToggle}
+              disabled={!recorderSupported}
+              className={`w-11 h-11 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-all duration-300 ${isRecording
+                ? 'bg-red-500/20 hover:bg-red-500/30 ring-1 ring-red-500/50'
+                : 'bg-white/[0.08] hover:bg-white/[0.14]'
+                } disabled:opacity-30 disabled:cursor-not-allowed`}
+              title={!recorderSupported ? 'Recording not supported in this browser' : isRecording ? 'Stop recording' : 'Start recording'}
+            >
+              <Circle
+                size={18}
+                className={isRecording ? 'text-red-400' : 'text-white/80'}
+                fill={isRecording ? 'currentColor' : 'none'}
+              />
             </button>
 
             {/* Emoji Reactions */}
@@ -269,9 +512,8 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
             <div className="relative" ref={deviceMenuRef}>
               <button
                 onClick={() => { setShowDeviceMenu(!showDeviceMenu); setShowParticipants(false); }}
-                className={`w-11 h-11 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-all duration-300 ${
-                  showDeviceMenu ? 'bg-white/[0.16]' : 'bg-white/[0.08] hover:bg-white/[0.14]'
-                }`}
+                className={`w-11 h-11 sm:w-12 sm:h-12 rounded-full flex items-center justify-center transition-all duration-300 ${showDeviceMenu ? 'bg-white/[0.16]' : 'bg-white/[0.08] hover:bg-white/[0.14]'
+                  }`}
                 title="Device settings"
               >
                 <Settings size={18} className="text-white/80" />
@@ -336,32 +578,27 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
             {/* Leave */}
             <button
               onClick={handleLeave}
-              className="w-11 h-11 sm:w-12 sm:h-12 rounded-full bg-red-500 hover:bg-red-600 flex items-center justify-center transition-all duration-300 active:scale-[0.94]"
-              title="Leave call"
+              disabled={isTranscribing}
+              className={`flex items-center gap-3 px-6 h-11 sm:h-12 rounded-full transition-all duration-300 active:scale-[0.94] ${isTranscribing || isProcessingAI
+                  ? 'bg-amber-500/20 text-amber-500 ring-1 ring-amber-500/50 cursor-wait'
+                  : 'bg-red-500 hover:bg-red-600 text-white'
+                }`}
+              title={isTranscribing ? 'Finalizing your recording...' : 'Leave call'}
             >
-              <PhoneOff size={18} className="text-white" />
+              <PhoneOff size={18} />
+              {(isTranscribing || isProcessingAI) && (
+                <span className="text-sm font-satoshi font-bold animate-pulse">
+                  Finalizing...
+                </span>
+              )}
             </button>
           </div>
 
-          {/* Right: Chat + Participants */}
+          {/* Right: Chat + Participants + Transcript */}
           <div className="flex flex-col items-end gap-2 shrink-0">
-            {/* Panels (chat or participants) */}
-            <div className="relative" ref={chatRef}>
-              {showChat && (
-                <div className="absolute bottom-full mb-3 right-0 z-50 animate-[fade-in-up_0.2s_ease-out]">
-                  <ChatBox
-                    socket={socket}
-                    roomId={roomId}
-                    userName={userName}
-                    onClose={() => setShowChat(false)}
-                  />
-                </div>
-              )}
-            </div>
-
             <div ref={participantsRef}>
               {showParticipants && (
-                <div className="w-64 sm:w-72 rounded-2xl frost-glass-panel shadow-2xl overflow-hidden animate-[fade-in-up_0.2s_ease-out]">
+                <div className="absolute bottom-full mb-3 right-0 w-64 sm:w-72 rounded-2xl frost-glass-panel shadow-2xl overflow-hidden animate-[fade-in-up_0.2s_ease-out] z-50">
                   <div className="flex items-center justify-between px-4 py-3 border-b border-white/[0.06]">
                     <span className="text-white/90 text-sm font-satoshi font-bold">In this call</span>
                     <button onClick={() => setShowParticipants(false)} className="text-white/30 hover:text-white/60 transition-colors">
@@ -408,12 +645,6 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
                         </div>
                       );
                     })}
-
-                    {participants.length === 0 && (
-                      <div className="px-4 py-6 text-center">
-                        <span className="text-white/20 text-xs font-cabinet">Waiting for others to join...</span>
-                      </div>
-                    )}
                   </div>
                 </div>
               )}
@@ -421,21 +652,35 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
 
             {/* Toggle buttons row */}
             <div className="flex items-center gap-2">
+              {/* Transcript toggle */}
+              <button
+                onClick={() => {
+                  setShowTranscript(!showTranscript);
+                  setShowDeviceMenu(false);
+                }}
+                className={`flex items-center gap-2 px-3 py-2 rounded-2xl transition-all duration-300 ${showTranscript
+                  ? 'frost-glass-active border-[#6B8E3D]/50 text-[#6B8E3D]'
+                  : 'frost-glass frost-glass-hover'
+                  }`}
+              >
+                <FileText size={14} className={showTranscript ? "text-[#6B8E3D]" : "text-white/60"} />
+                <span className={`text-sm font-cabinet font-medium ${showTranscript ? "text-[#6B8E3D]" : "text-white/70"}`}>Transcript</span>
+              </button>
+
               {/* Chat toggle */}
               <button
                 onClick={() => {
                   setShowChat(!showChat);
-                  if (!showChat) { setUnreadCount(0); setShowParticipants(false); }
+                  if (!showChat) setUnreadCount(0);
                   setShowDeviceMenu(false);
                 }}
-                className={`relative flex items-center gap-2 px-3 py-2 rounded-2xl transition-all duration-300 ${
-                  showChat
-                    ? 'frost-glass-active'
-                    : 'frost-glass frost-glass-hover'
-                }`}
+                className={`relative flex items-center gap-2 px-3 py-2 rounded-2xl transition-all duration-300 ${showChat
+                  ? 'frost-glass-active border-[#6B8E3D]/50 text-[#6B8E3D]'
+                  : 'frost-glass frost-glass-hover'
+                  }`}
               >
-                <MessageCircle size={14} className="text-white/60" />
-                <span className="text-white/70 text-sm font-cabinet font-medium">Chat</span>
+                <MessageCircle size={14} className={showChat ? "text-[#6B8E3D]" : "text-white/60"} />
+                <span className={`text-sm font-cabinet font-medium ${showChat ? "text-[#6B8E3D]" : "text-white/70"}`}>Chat</span>
                 {unreadCount > 0 && (
                   <span className="w-5 h-5 rounded-full bg-[#556B2F] flex items-center justify-center">
                     <span className="text-white text-[9px] font-satoshi font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>
@@ -445,15 +690,14 @@ export default function VideoCall({ roomId, userName, onLeave, initialAudioMuted
 
               {/* Participants toggle */}
               <button
-                onClick={() => { setShowParticipants(!showParticipants); if (!showParticipants) setShowChat(false); setShowDeviceMenu(false); }}
-                className={`flex items-center gap-2 px-3 py-2 rounded-2xl transition-all duration-300 ${
-                  showParticipants
-                    ? 'frost-glass-active'
-                    : 'frost-glass frost-glass-hover'
-                }`}
+                onClick={() => { setShowParticipants(!showParticipants); setShowDeviceMenu(false); }}
+                className={`flex items-center gap-2 px-3 py-2 rounded-2xl transition-all duration-300 ${showParticipants
+                  ? 'frost-glass-active border-[#6B8E3D]/50 text-[#6B8E3D]'
+                  : 'frost-glass frost-glass-hover'
+                  }`}
               >
-                <Users size={14} className="text-white/60" />
-                <span className="text-white/70 text-sm font-cabinet font-medium">{participantCount}</span>
+                <Users size={14} className={showParticipants ? "text-[#6B8E3D]" : "text-white/60"} />
+                <span className={`text-sm font-cabinet font-medium ${showParticipants ? "text-[#6B8E3D]" : "text-white/70"}`}>{participantCount}</span>
                 <ChevronUp size={12} className={`text-white/40 transition-transform duration-300 ${showParticipants ? 'rotate-180' : ''}`} />
               </button>
             </div>
